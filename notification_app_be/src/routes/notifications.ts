@@ -18,7 +18,10 @@ router.get('/', async (req: Request, res: Response) => {
     if (page) params.page = String(page);
     if (notification_type) params.notification_type = String(notification_type);
 
-    const response = await axios.get(NOTIFICATIONS_API, { params });
+    const response = await axios.get(NOTIFICATIONS_API, { 
+      params,
+      headers: { Authorization: `Bearer ${process.env.AUTH_TOKEN}` }
+    });
     const notifications = response.data.notifications || [];
 
     logger.info('route', `Fetched ${notifications.length} notifications from upstream`);
@@ -39,7 +42,10 @@ router.get('/priority', async (req: Request, res: Response) => {
     const params: Record<string, string> = { limit: '100' };
     if (notification_type) params.notification_type = String(notification_type);
 
-    const response = await axios.get(NOTIFICATIONS_API, { params });
+    const response = await axios.get(NOTIFICATIONS_API, { 
+      params,
+      headers: { Authorization: `Bearer ${process.env.AUTH_TOKEN}` }
+    });
     const notifications: any[] = response.data.notifications || [];
 
     const WEIGHT: Record<string, number> = {

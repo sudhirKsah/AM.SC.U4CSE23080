@@ -1,4 +1,5 @@
 import axios from 'axios';
+import 'dotenv/config';
 
 export type Stack = 'backend' | 'frontend';
 export type Level = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
@@ -122,6 +123,7 @@ class LoggerService {
           timeout: this.TIMEOUT,
           headers: {
             'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.AUTH_TOKEN}`
           },
         }
       );
