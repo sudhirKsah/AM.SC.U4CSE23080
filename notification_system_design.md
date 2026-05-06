@@ -198,7 +198,7 @@ For real-time notifications, implement WebSocket support:
 
 **WebSocket Events:**
 
-#### Server → Client (Incoming)
+#### Server -> Client (Incoming)
 ```json
 {
   "event": "notification:new",
@@ -212,7 +212,7 @@ For real-time notifications, implement WebSocket support:
 }
 ```
 
-#### Client → Server (Heartbeat)
+#### Client -> Server (Heartbeat)
 ```json
 {
   "event": "ping",
@@ -220,7 +220,7 @@ For real-time notifications, implement WebSocket support:
 }
 ```
 
-#### Server → Client (Heartbeat Response)
+#### Server -> Client (Heartbeat Response)
 ```json
 {
   "event": "pong",
@@ -556,7 +556,7 @@ ORDER BY created_at ASC;
 ```
 {
   id: UUID,
-  student_id: UUID (FK → students),
+  student_id: UUID (FK -> students),
   title: String,
   message: Text,
   type: Enum('Event', 'Result', 'Placement'),
@@ -813,5 +813,369 @@ uuid_3          | AM.SC.23003 | std3@abc.edu    | Amit Sharma   | 1             
 - Track query execution times
 - Monitor index usage statistics
 - Plan index maintenance during off-peak hours
+
+---
+
+---
+
+# Stage 4: Performance Solutions - Caching & Optimization Strategies
+
+## Problem Statement
+
+**Current Issue:**
+The notification platform is experiencing performance bottlenecks:
+- DB is getting overwhelmed with repeated reads for the same data
+- Fetching notifications for each page load triggers multiple DB queries
+- Real-time fetches for unread counts happening on every API call
+- Network latency between app and database adds up quickly
+- System struggles with 50K concurrent users checking notifications
+
+---
+
+## Performance Issues Analysis
+
+### Issue 1: Repeated Database Queries
+```
+Each page load triggers:
+  - GET /api/notifications (20 notifications) -> DB Query
+  - GET /api/notifications/count/unread -> DB Query
+  - WebSocket connection -> Real-time updates
+  
+With 50K concurrent students:
+  50,000 × 2 queries = 100,000 DB queries per "page load cycle"
+  Expected load: 500-1000 queries/second
+  DB capacity: ~200-300 queries/second -> System OVERLOADED
+```
+
+### Issue 2: Network Latency
+```
+Single API call chain:
+  Frontend Request
+    -> Network (50ms)
+      -> DB Query (20ms)
+        -> Network (50ms)
+          -> Frontend Response
+  
+  Total latency: 120ms per request
+  With 3-5 requests per page: 360-600ms (noticeable delay)
+```
+
+### Issue 3: Cache Invalidation Complexity
+```
+Without proper caching:
+- Same user notification list queried repeatedly
+- Sorting/filtering results in memory repeatedly
+- No way to serve stale-but-reasonable data
+```
+
+---
+
+## Solution 1: Caching Strategy
+
+### Caching Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Frontend (Browser)                     │
+│                  (In-Memory Cache)                        │
+└────────────────────┬────────────────────────────────────┘
+                     │ (Cache Hit/Miss)
+┌────────────────────|────────────────────────────────────┐
+│              Backend API Server                           │
+│       (Application-Level Cache Layer)                     │
+│         ┌─────────────────────────────────────┐          │
+│         │  Redis Cache (5-minute TTL)        │          │
+│         │  - User notification lists          │          │
+│         │  - Unread counts                    │          │
+│         │  - Recent searches                  │          │
+│         └─────────────────────────────────────┘          │
+└────────────────────┬────────────────────────────────────┘
+                     │ (Cache Miss -> DB Query)
+┌────────────────────|────────────────────────────────────┐
+│                  PostgreSQL Database                      │
+│              (Source of Truth)                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Cache Keys Strategy
+
+```javascript
+// User notifications list (paginated)
+CACHE_KEY_NOTIFICATIONS = `notif:student:${studentId}:page:${pageNum}:limit:${limit}`
+TTL = 5 minutes
+
+// Unread count
+CACHE_KEY_UNREAD_COUNT = `notif:student:${studentId}:unread:count`
+TTL = 1 minute (more frequent updates)
+
+// Notification type filter
+CACHE_KEY_TYPE_FILTER = `notif:student:${studentId}:type:${type}:page:${pageNum}`
+TTL = 5 minutes
+
+// Global notification types list (shared across all students)
+CACHE_KEY_NOTIFICATION_TYPES = `notif:types:list`
+TTL = 24 hours (rarely changes)
+
+// Placement notifications (last 7 days)
+CACHE_KEY_PLACEMENT_RECENT = `notif:placement:recent:7days:page:${pageNum}`
+TTL = 10 minutes
+```
+
+### Caching Implementation Pseudocode
+
+```javascript
+// GET /api/notifications endpoint
+async function getNotifications(studentId, page = 1, limit = 20) {
+  // Step 1: Check cache
+  const cacheKey = `notif:student:${studentId}:page:${page}:limit:${limit}`;
+  const cachedResult = await redis.get(cacheKey);
+  
+  if (cachedResult) {
+    console.log("Cache HIT - Returning from Redis");
+    return JSON.parse(cachedResult);  // 5-10ms response
+  }
+  
+  // Step 2: Cache miss - query database
+  console.log("Cache MISS - Querying database");
+  const notifications = await db.query(`
+    SELECT id, title, message, type, is_read, priority, created_at
+    FROM notifications
+    WHERE student_id = $1 AND deleted_at IS NULL
+    ORDER BY created_at DESC
+    LIMIT $2 OFFSET ${(page - 1) * limit}
+  `, [studentId, limit]);
+  
+  // Step 3: Cache the result
+  await redis.setex(cacheKey, 300, JSON.stringify(notifications));  // 5 min TTL
+  
+  return notifications;
+}
+
+// GET /api/notifications/count/unread endpoint
+async function getUnreadCount(studentId) {
+  // More aggressive caching for counts (1 minute TTL)
+  const cacheKey = `notif:student:${studentId}:unread:count`;
+  const cachedCount = await redis.get(cacheKey);
+  
+  if (cachedCount) {
+    return { unreadCount: parseInt(cachedCount) };
+  }
+  
+  const result = await db.query(`
+    SELECT COUNT(*) as unread_count
+    FROM notifications
+    WHERE student_id = $1 AND is_read = false AND deleted_at IS NULL
+  `, [studentId]);
+  
+  await redis.setex(cacheKey, 60, result.rows[0].unread_count);  // 1 min TTL
+  
+  return result.rows[0];
+}
+```
+
+---
+
+## Solution 2: Cache Invalidation Strategy
+
+### When to Invalidate Cache
+
+```
+Event                          Cache Keys to Clear
+────────────────────────────────────────────────────────────
+Notification Created      ->    notif:student:{id}:*
+                              notif:placement:recent:*
+                              
+Notification Marked Read  ->    notif:student:{id}:*
+                              notif:student:{id}:unread:count
+                              
+Notification Deleted      ->    notif:student:{id}:*
+                              notif:student:{id}:unread:count
+                              
+User Updates Profile      ->    notif:student:{id}:*
+```
+
+### Cache Invalidation Pseudocode
+
+```javascript
+// When marking notification as read
+async function markAsRead(notificationId, studentId) {
+  // Update database
+  await db.query(`
+    UPDATE notifications SET is_read = true WHERE id = $1
+  `, [notificationId]);
+  
+  // Invalidate all affected cache keys
+  const pattern = `notif:student:${studentId}:*`;
+  const keys = await redis.keys(pattern);
+  
+  if (keys.length > 0) {
+    await redis.del(...keys);  // Remove all matching keys
+  }
+  
+  // Also invalidate unread count cache (separate, shorter TTL)
+  await redis.del(`notif:student:${studentId}:unread:count`);
+  
+  console.log(`Cache invalidated for student ${studentId}`);
+}
+```
+
+---
+
+## Solution 3: Database Connection Pooling
+
+### Issue
+```
+Without pooling:
+- Each request creates new DB connection
+- Connection creation: 50-100ms overhead
+- Connection overhead dominates actual query time
+```
+
+### Solution: Connection Pool
+```javascript
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: 5432,
+  database: 'notifications_db',
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  max: 20,              
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// Reuse connections from pool
+const result = await pool.query('SELECT ...');  
+```
+
+---
+
+## Solution 4: Frontend Caching
+
+### Client-Side Caching Strategy
+
+```javascript
+// In React component
+import { useQuery } from '@tanstack/react-query';
+
+function NotificationList() {
+  const { data: notifications } = useQuery({
+    queryKey: ['notifications', studentId, page],
+    queryFn: () => fetchNotifications(studentId, page),
+    staleTime: 5 * 60 * 1000,      // Cache for 5 minutes
+    gcTime: 10 * 60 * 1000,        // Keep in memory for 10 minutes
+    refetchInterval: 30 * 1000,    // Auto-refresh every 30 seconds
+  });
+
+  return (
+    <div>
+      {notifications?.map(n => (
+        <NotificationCard key={n.id} notification={n} />
+      ))}
+    </div>
+  );
+}
+```
+
+**Benefits:**
+- Eliminates redundant API calls
+- Faster page transitions
+- Better perceived performance
+- Reduces backend load by 60-70%
+
+---
+
+## Solution 5: Pagination & Lazy Loading
+
+### Bad Approach (Fetch All)
+```javascript
+// DON'T: Fetch all notifications at once
+SELECT * FROM notifications WHERE student_id = 1042;
+// Returns 500 notifications × ~500 bytes = 250 KB of data
+```
+
+### Good Approach (Pagination)
+```javascript
+// Fetch page by page
+SELECT * FROM notifications 
+WHERE student_id = 1042 
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 0;  // First 20 notifications = 10 KB
+
+// Subsequent pages:
+LIMIT 20 OFFSET 20;  // Next 20
+LIMIT 20 OFFSET 40;  // Next 20
+```
+
+**Benefits:**
+- Smaller payload per request
+- Faster initial load
+- Better mobile experience
+- More responsive pagination
+
+---
+
+## Performance Comparison
+
+### Before Optimization
+
+| Operation | Time | DB Queries |
+|-----------|------|-----------|
+| Load notifications page | 600ms | 2 |
+| Mark as read | 150ms | 1 |
+| Get unread count | 100ms | 1 |
+| **Total per session** | **850ms** | **4** |
+| **50K users × 4 queries** | — | **200K/min** |
+
+### After Optimization
+
+| Operation | Time | DB Queries |
+|-----------|------|-----------|
+| Load notifications (cached) | 15ms | 0 (Redis) |
+| Mark as read | 50ms | 1 |
+| Get unread count (cached) | 5ms | 0 (Redis) |
+| **Total per session** | **70ms** | **1** |
+| **50K users × 1 query** | — | **50K/min** |
+
+**Improvement:**
+- Page load: 600ms -> 15ms
+- Overall response: 850ms -> 70ms
+- DB load: 200K -> 50K queries/min
+- Can now handle 200K concurrent users (was 50K before)
+
+---
+
+## Solution 6: Database Query Optimization
+
+### Use Materialized Views for Complex Queries
+
+```sql
+-- Materialized view for students with recent placement notifications
+CREATE MATERIALIZED VIEW placement_notifications_summary AS
+SELECT 
+  s.id,
+  s.roll_number,
+  s.email,
+  COUNT(n.id) as placement_count,
+  MAX(n.created_at) as latest_placement
+FROM students s
+LEFT JOIN notifications n ON s.id = n.student_id 
+  AND n.type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days'
+  AND n.deleted_at IS NULL
+GROUP BY s.id, s.roll_number, s.email;
+
+-- Refresh periodically (every 1 hour)
+REFRESH MATERIALIZED VIEW placement_notifications_summary;
+
+-- Query becomes simple and fast
+SELECT * FROM placement_notifications_summary 
+WHERE placement_count > 0
+ORDER BY latest_placement DESC;
+```
+
+---
+
+---
 
 
