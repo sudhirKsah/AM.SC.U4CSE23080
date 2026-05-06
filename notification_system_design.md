@@ -578,3 +578,240 @@ ORDER BY created_at ASC;
 
 ---
 
+---
+
+# Stage 3: Query Optimization and Performance Analysis
+
+## Scenario Context
+
+**Current State:**
+- Database has grown to **50,000 students**
+- **5,000,000+ notifications** in the system
+- The notification API is experiencing performance issues
+- A developer wrote a query to fetch unread notifications that is now performing slowly
+
+---
+
+## The Problematic Query
+
+### Original Query (SLOW)
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+---
+
+## Analysis: Why Is This Query Slow?
+
+### Problem Breakdown:
+
+1. **Full Table Scan Required**
+   - Without indexes, the database must scan ALL 5,000,000 rows
+   - For each row, check if studentID = 1042 AND isRead = false
+   - Filter millions of rows to find maybe 20-30 notifications
+   - Performance: **Could take 2-5 SECONDS** on a large table
+
+2. **No Index Support**
+   - The database engine cannot use indexes to speed up the filtering
+   - Must evaluate every single row
+
+3. **Additional Issues**
+   - `SELECT *` fetches all columns including potentially large `metadata` JSONB field
+   - Sorting by `createdAt` without an index requires sorting in memory
+   - With 5M rows, this is extremely expensive
+
+### Estimated Query Cost:
+- **Without Index:** ~2000-5000ms
+- **With Composite Index:** ~10-50ms
+
+---
+
+## Solution: Strategic Indexing
+
+### Why Add Indexes?
+
+**Benefits:**
+1. Reduce full table scans to index lookups
+2. Database can find matching rows in O(log n) time instead of O(n)
+3. On 5M rows: **100x faster** query execution
+4. Minimal storage overhead for indices
+
+### Index Strategy
+
+#### Primary Index (CRITICAL)
+```sql
+CREATE INDEX idx_notifications_student_id_is_read ON notifications(student_id, is_read);
+```
+
+**Why Composite Index?**
+- First filters by `student_id` (narrow down from 5M to ~50 rows per student)
+- Then filters by `is_read` (further narrow to ~20-30 unread)
+- Database uses this index to satisfy both WHERE conditions efficiently
+
+#### Secondary Indexes (Supporting)
+```sql
+CREATE INDEX idx_notifications_student_id_created_at ON notifications(student_id, created_at DESC);
+CREATE INDEX idx_notifications_type ON notifications(type);
+```
+
+---
+
+## Optimized Query
+
+### Improved Query (FAST)
+```sql
+SELECT 
+  id,
+  student_id,
+  title,
+  message,
+  type,
+  priority,
+  is_read,
+  metadata,
+  created_at,
+  updated_at
+FROM notifications
+WHERE student_id = 1042 
+  AND is_read = false
+  AND deleted_at IS NULL
+ORDER BY created_at DESC;
+```
+
+### Key Improvements:
+1. **Selective columns** - Instead of SELECT *, only fetch needed columns
+2. **Composite index support** - Leverages idx_notifications_student_id_is_read
+3. **Soft delete consideration** - Excludes deleted records
+4. **Better sort order** - Most recent notifications first (DESC)
+
+### Performance Comparison:
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Query Time | 2-5 seconds | 10-50 milliseconds |
+| Rows Scanned | 5,000,000 | ~30 |
+| Index Usage | None | Composite Index |
+| Result Set | All columns | Needed columns only |
+| **Improvement Factor** | — | **100-500x faster** |
+
+---
+
+## Query Optimization Techniques
+
+### 1. Column Selection
+```sql
+-- BAD: Fetches unnecessary data
+SELECT * FROM notifications WHERE student_id = 1042;
+
+-- GOOD: Only what's needed
+SELECT id, title, message, type, is_read, created_at
+FROM notifications WHERE student_id = 1042;
+```
+
+### 2. Filtering with Indexes
+```sql
+-- BAD: Function calls prevent index usage
+SELECT * FROM notifications 
+WHERE YEAR(created_at) = 2026;
+
+-- GOOD: Date range filtering preserves index
+SELECT * FROM notifications 
+WHERE created_at >= '2026-01-01' AND created_at < '2026-02-01';
+```
+
+### 3. Pagination
+```sql
+-- GOOD: Limit results to prevent loading entire result set
+SELECT id, title, message, type, is_read, created_at
+FROM notifications
+WHERE student_id = 1042 AND is_read = false
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 0;
+```
+
+---
+
+## Advanced Query: Find Students with Placement Notifications (Last 7 Days)
+
+### Business Requirement
+"Find all students who received a Placement notification in the last 7 days"
+
+### Solution Query
+```sql
+SELECT DISTINCT
+  s.id,
+  s.roll_number,
+  s.email,
+  s.name,
+  COUNT(n.id) as placement_notification_count,
+  MAX(n.created_at) as latest_placement_notification
+FROM students s
+INNER JOIN notifications n ON s.id = n.student_id
+WHERE n.type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days'
+  AND n.deleted_at IS NULL
+GROUP BY s.id, s.roll_number, s.email, s.name
+ORDER BY latest_placement_notification DESC;
+```
+
+### Query Explanation:
+
+1. **INNER JOIN** - Connect students with their notifications
+2. **WHERE n.type = 'Placement'** - Filter for placement type only
+3. **n.created_at >= NOW() - INTERVAL '7 days'** - Last 7 days constraint
+4. **DISTINCT** - Avoid duplicate students
+5. **GROUP BY** - Aggregate notifications per student
+6. **COUNT(n.id)** - How many placement notifications each student got
+7. **MAX(n.created_at)** - When was the most recent one
+
+### Supporting Indexes for This Query
+```sql
+CREATE INDEX idx_notifications_type_created_at ON notifications(type, created_at DESC);
+CREATE INDEX idx_notifications_student_id_type_created_at ON notifications(student_id, type, created_at DESC);
+```
+
+### Expected Result
+```
+id              | roll_number | email           | name          | placement_notification_count | latest_placement_notification
+uuid_1          | AM.SC.23001 | std1@abc.edu    | Raj Kumar     | 3                            | 2026-04-22 17:51:30
+uuid_2          | AM.SC.23002 | std2@abc.edu    | Priya Singh   | 2                            | 2026-04-22 17:45:12
+uuid_3          | AM.SC.23003 | std3@abc.edu    | Amit Sharma   | 1                            | 2026-04-21 16:30:45
+```
+
+### Query Performance
+- **Expected execution time:** < 200ms
+- **Rows processed:** ~50,000 (student count) + ~1M (recent placement notifications)
+- **Index benefit:** Reduces processed rows by 80%
+
+---
+
+## Summary: Stage 3 Conclusions
+
+### Key Findings:
+
+1. **Original Query Issue:** Full table scan on 5M rows without indexes
+2. **Root Cause:** Missing composite index on (student_id, is_read)
+3. **Impact:** 2-5 second query response (unacceptable for API)
+4. **Solution:** Strategic indexes reduce query time to 10-50ms
+
+### Recommendations:
+
+**DO add indexes:**
+- Composite index on (student_id, is_read)
+- Index on (type, created_at) for filtering by notification type
+- Index on (student_id, created_at) for sorting queries
+
+**DO optimize queries:**
+- Select only needed columns
+- Use LIMIT for pagination
+- Use date ranges instead of function calls
+- Add soft delete checks
+
+**Monitor Performance:**
+- Track query execution times
+- Monitor index usage statistics
+- Plan index maintenance during off-peak hours
+
+
