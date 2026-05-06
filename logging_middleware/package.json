@@ -1,0 +1,26 @@
+{
+  "name": "logging-middleware",
+  "version": "1.0.0",
+  "description": "Reusable logging middleware for notification system",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "jest"
+  },
+  "keywords": [
+    "logging",
+    "middleware",
+    "notifications"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

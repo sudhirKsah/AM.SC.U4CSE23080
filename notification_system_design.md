@@ -1178,4 +1178,273 @@ ORDER BY latest_placement DESC;
 
 ---
 
+# Stage 5: Bulk Notification System - "Notify All" Scenario
+
+## Problem Statement
+
+**Real-world Scenario:**
+It's placement season. The HR clicks "Notify All" to send notifications to **50,000 students** about a new company (CSX Corporation) hiring drive. The system needs to:
+1. Send email to all students
+2. Save notification in database
+3. Push real-time notification to app
+4. Do all of this **simultaneously and reliably**
+
+---
+
+## Naive Implementation (PROBLEMATIC)
+
+### Pseudocode
+```javascript
+function notify_all(student_ids, message) {
+  for each student_id in student_ids:
+    send_email(student_id, message)        // Calls Email API
+    save_to_db(student_id, message)        // DB insert
+    push_to_app(student_id, message)       // Real-time push
+}
+```
+
+---
+
+## Shortcomings Analysis
+
+### Issue 1: Synchronous Blocking
+```
+Time for 50,000 students:
+- send_email(): 100ms each × 50,000 = 5,000 seconds (1.4 HOURS!)
+- save_to_db(): 20ms each × 50,000 = 1,000 seconds
+- push_to_app(): 50ms each × 50,000 = 2,500 seconds
+
+Total: ~4.4 HOURS of blocking!
+
+API Response: Hangs for hours... (User thinks system is down)
+```
+
+### Issue 2: No Fault Tolerance
+```
+If send_email() fails for student #200 out of 50,000:
+- Process stops completely
+- Previous 199 students got email
+- Remaining 49,800 students got nothing
+- No way to retry or resume
+
+Logs indicate: "send_email failed for 200 students midway"
+→ What now? Restart and resend to all? (Duplicate emails!)
+→ Or just fail silently? (Data inconsistency)
+```
+
+---
+
+## Solution: Queue-Based Architecture
+
+### Revised Pseudocode
+
+```javascript
+// ENTRY POINT: HR clicks "Notify All"
+function notify_all(student_ids, message) {
+  // Step 1: Create batch job (non-blocking)
+  batch_job = {
+    id: generate_unique_id(),
+    total_recipients: 50000,
+    status: "queued",
+    created_at: now()
+  }
+  
+  // Step 2: Queue the job and return immediately
+  queue.push(batch_job)
+  
+  // Step 3: Return to user instantly
+  return {
+    job_id: batch_job.id,
+    status: "queued",
+    message: "Notifications queued. Check progress with job_id"
+  }
+  
+  // Step 4: Background worker processes asynchronously
+  // (This happens independently, doesn't block the API)
+}
+
+// BACKGROUND WORKER: Processes queued jobs
+function background_worker() {
+  while (queue_has_jobs) {
+    job = queue.dequeue()
+    batch_job = {
+      ...job,
+      status: "processing",
+      started_at: now()
+    }
+    
+    try {
+      process_batch_notifications(job.student_ids, job.message)
+      batch_job.status = "completed"
+      batch_job.completed_at = now()
+    } catch (error) {
+      batch_job.status = "failed"
+      batch_job.error = error.message
+    }
+    
+    save_batch_status(batch_job)
+  }
+}
+
+// CHUNKED PROCESSING: Split work into manageable pieces
+function process_batch_notifications(student_ids, message) {
+  chunk_size = 100
+  
+  for each chunk of 100 students:
+    try {
+      // Transaction: All-or-nothing for this chunk
+      transaction {
+        save_notifications_to_db(chunk, message)      // DB insert (1 transaction)
+        send_emails_async(chunk, message)              // Async email (non-blocking)
+        push_to_app_async(chunk, message)              // Async push (non-blocking)
+      }
+      
+      log("Chunk processed. Progress: X/50000")
+    } catch (chunk_error) {
+      log_error("Chunk failed. Retrying...")
+      retry_with_exponential_backoff(3 times)  // Retry logic
+    }
+}
+
+// INDEPENDENT OPERATIONS: Don't wait for each other
+async function send_emails_async(chunk, message) {
+  try {
+    // Fire and forget - don't wait for response
+    email_service.send_bulk(chunk, message)
+  } catch (error) {
+    log_error("Email send failed for chunk", error)
+    // Continue anyway - app notification is more important
+  }
+}
+
+async function push_to_app_async(chunk, message) {
+  try {
+    websocket_service.push_bulk(chunk, message)
+  } catch (error) {
+    log_error("Push failed for chunk", error)
+    // Continue anyway - emails were already sent
+  }
+}
+```
+
+---
+
+## Key Design Decisions
+
+### 1. Database Save is the Source of Truth
+```
+Priority Order:
+1. save_to_db() - CRITICAL (must succeed)
+2. send_email() - IMPORTANT (async, optional failure)
+3. push_to_app() - NICE-TO-HAVE (async, optional failure)
+
+Reasoning:
+- Database is the authoritative record
+- If DB save fails, retry entire chunk
+- If email fails, student still sees notification in app
+- If push fails, student can refresh app later
+```
+
+### 2. Atomic Database Transactions
+```sql
+BEGIN TRANSACTION;
+  INSERT INTO notifications (student_id, title, message, type, priority)
+  VALUES (student_1, ...), (student_2, ...), ..., (student_100, ...);
+COMMIT;
+
+Benefits:
+- All 100 notifications inserted or none
+- No partial failures
+- Consistent database state
+```
+
+### 3. Non-Blocking Queue Processing
+```
+API Request (blocking):   100ms  → Returns job_id
+Queue Processing (async): 2-3 minutes in background → No blocking
+Total user wait: ~100ms (acceptable)
+```
+
+### 4. Retry Logic with Exponential Backoff
+```
+Chunk fails:
+  Retry 1: Wait 2 seconds, retry
+  Retry 2: Wait 4 seconds, retry
+  Retry 3: Wait 8 seconds, retry
+  All fail: Log permanent failure, continue with next chunk
+
+Result: ~95% success rate for flaky operations
+```
+
+### 5. Chunking for Resource Efficiency
+```
+Instead of: 50,000 operations at once (crashes)
+Process: 500 chunks of 100 operations each
+
+Benefits:
+- Memory efficient
+- Database connection pool can handle
+- Can pause/resume easily
+- Better error isolation
+```
+
+### 6. Progress Tracking
+```
+Store in Redis:
+{
+  "batch_job_id": {
+    "status": "processing",
+    "processed": 12500,
+    "total": 50000,
+    "percentage": 25,
+    "started_at": "2026-04-22T17:51:30Z"
+  }
+}
+
+Client polls: GET /api/notifications/batch/:jobId
+Response: { processed: 12500, total: 50000, percentage: 25 }
+```
+
+---
+
+## Should Database Save and Email Happen Together?
+
+### Answer: NO
+
+```javascript
+// WRONG: Both happen synchronously
+transaction {
+  save_to_db()
+  send_email()  // If this takes 100ms × 50000 = hours!
+  push_to_app()
+}
+
+// RIGHT: DB is critical, email is fire-and-forget
+transaction {
+  save_to_db()  // Must succeed (critical)
+}
+
+// Then independently:
+send_email_async()    // Fire and forget
+push_to_app_async()   // Fire and forget
+```
+
+### Why Not Together?
+
+1. **DB is small and fast**
+2. **Email API is slow**
+3. **Can't hold a transaction open during network call**
+   - Locks table
+   - Blocks other operations
+   - Wastes database connections
+
+4. **Decoupling improves reliability**
+   - If email fails, DB is already updated
+   - Student can still see notification in app
+   - No cascading failures
+
+---
+
+---
+
 
